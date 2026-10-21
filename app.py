@@ -59,9 +59,62 @@ def get_db():
 
 
 def init_db():
-    """Create missing tables and safely add new columns."""
+    """Create required database tables and safely add missing columns."""
 
     with get_db() as db:
+        # Create the core users table if it does not exist.
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'patient',
+                phone TEXT
+            )
+        """)
+
+        # Create the patients table if it does not exist.
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS patients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                phone TEXT
+            )
+        """)
+
+        # Create the doctors table if it does not exist.
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS doctors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE,
+                name TEXT NOT NULL,
+                specialization TEXT NOT NULL,
+                experience INTEGER DEFAULT 0,
+                fee REAL DEFAULT 500,
+                available_days TEXT DEFAULT 'Monday-Friday',
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+
+        # Create the appointments table if it does not exist.
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS appointments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id INTEGER NOT NULL,
+                doctor_id INTEGER NOT NULL,
+                appointment_date TEXT NOT NULL,
+                appointment_time TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Booked',
+                FOREIGN KEY(patient_id) REFERENCES users(id),
+                FOREIGN KEY(doctor_id) REFERENCES doctors(id),
+                UNIQUE(doctor_id, appointment_date, appointment_time)
+            )
+        """)
+
+        # Add the phone column to older databases if necessary.
         user_columns = {
             row["name"]
             for row in db.execute("PRAGMA table_info(users)").fetchall()
@@ -78,20 +131,20 @@ def init_db():
         if "phone" not in patient_columns:
             db.execute("ALTER TABLE patients ADD COLUMN phone TEXT")
 
+        # Prevent duplicate phone numbers while allowing blank numbers.
         db.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS
-            idx_users_phone_unique
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique
             ON users(phone)
             WHERE phone IS NOT NULL AND phone != ''
         """)
 
         db.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS
-            idx_patients_phone_unique
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_patients_phone_unique
             ON patients(phone)
             WHERE phone IS NOT NULL AND phone != ''
         """)
 
+        # Password-reset tokens.
         db.execute("""
             CREATE TABLE IF NOT EXISTS password_reset_tokens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,6 +158,7 @@ def init_db():
             )
         """)
 
+        # Doctor date availability.
         db.execute("""
             CREATE TABLE IF NOT EXISTS doctor_date_availability (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,6 +170,7 @@ def init_db():
             )
         """)
 
+        # Individual appointment-slot availability.
         db.execute("""
             CREATE TABLE IF NOT EXISTS doctor_slot_availability (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,7 +183,7 @@ def init_db():
             )
         """)
 
-        # Real patient reviews. Existing database records are preserved.
+        # Patient reviews.
         db.execute("""
             CREATE TABLE IF NOT EXISTS doctor_reviews (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,11 +202,11 @@ def init_db():
             )
         """)
 
+        # Improve doctor-review lookup performance.
         db.execute("""
             CREATE INDEX IF NOT EXISTS idx_doctor_reviews_doctor
             ON doctor_reviews(doctor_id)
         """)
-
 
 def verify_password(stored_password, entered_password):
     if not stored_password:
