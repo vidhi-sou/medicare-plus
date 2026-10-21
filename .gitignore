@@ -1,0 +1,6 @@
+.env
+appointments.db
+__pycache__/
+*.py[cod]
+.venv/
+venv/

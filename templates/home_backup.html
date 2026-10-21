@@ -1,0 +1,276 @@
+
+{% extends "base.html" %}
+{% block title %}Home | MediCare+{% endblock %}
+
+{% block content %}
+
+<section class="hero">
+    <div class="hero-content">
+        <p class="eyebrow">YOUR HEALTH, OUR PRIORITY</p>
+        <h1>Better Healthcare.<br>Made Simple.</h1>
+        <p>Find experienced doctors, explore their specializations, and schedule your appointment in just a few simple steps.</p>
+
+        <div class="hero-actions">
+            {% if session.get('role') == 'patient' %}
+                <a href="{{ url_for('patient_dashboard') }}" class="btn">Book an Appointment</a>
+            {% elif not session.get('user_id') %}
+                <a href="{{ url_for('register') }}" class="btn">Get Started</a>
+                <a href="{{ url_for('login') }}" class="btn btn-outline">Login</a>
+            {% endif %}
+        </div>
+
+        <div class="hero-trust">
+            <span>✓ Easy appointment booking</span>
+            <span>✓ Convenient scheduling</span>
+        </div>
+    </div>
+
+    <div class="hero-image">
+        <img src="https://images.unsplash.com/photo-1559839734-2b71ea197ec2?auto=format&fit=crop&w=900&q=85"
+             alt="Doctor ready to help patients" loading="eager">
+        <div class="hero-image-caption">
+            <span class="hero-caption-icon">✚</span>
+            <div>
+                <strong>Your Health Matters</strong>
+                <p>Care that puts you first</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section class="benefits-section">
+    <div class="section-heading">
+        <p class="eyebrow">WHY MEDICARE+</p>
+        <h2>Healthcare Without the Hassle</h2>
+        <p>Everything you need to make managing your healthcare easier.</p>
+    </div>
+
+    <div class="benefits-grid">
+        <article class="benefit-card">
+            <div class="benefit-icon">⚕</div>
+            <h3>Experienced Doctors</h3>
+            <p>Explore doctor specializations and experience to find the right fit for your needs.</p>
+        </article>
+        <article class="benefit-card">
+            <div class="benefit-icon">📅</div>
+            <h3>Easy Booking</h3>
+            <p>Choose a date and an available time slot without making unnecessary phone calls.</p>
+        </article>
+        <article class="benefit-card">
+            <div class="benefit-icon">♡</div>
+            <h3>Patient Convenience</h3>
+            <p>Manage your appointments online and check your booking details in one place.</p>
+        </article>
+    </div>
+</section>
+
+<section id="doctors" class="home-doctors">
+    <div class="section-heading">
+        <p class="eyebrow">OUR SPECIALISTS</p>
+        <h2>
+            {% if session.get('role') == 'patient' %}
+                Meet Our Doctors
+            {% else %}
+                Find the Care You Need
+            {% endif %}
+        </h2>
+        {% if session.get('role') == 'patient' %}
+            <p>Choose a doctor who suits your healthcare needs.</p>
+        {% else %}
+            <p>Sign in to explore our doctors, view consultation fees, and book an appointment.</p>
+        {% endif %}
+    </div>
+
+    {% if session.get('role') == 'patient' %}
+        <div class="doctor-grid">
+            {% for doctor in doctors %}
+                {% set specialty = doctor.specialization|lower %}
+
+                {% if 'cardio' in specialty %}
+                    {% set doctor_image = 'https://images.unsplash.com/photo-1622253692010-333f2da6031d?auto=format&fit=crop&w=700&q=85' %}
+                {% elif 'ortho' in specialty or 'bone' in specialty or 'joint' in specialty %}
+                    {% set doctor_image = 'https://images.unsplash.com/photo-1612349317150-e413f6a5b16d?auto=format&fit=crop&w=700&q=85' %}
+                {% elif 'dermat' in specialty or 'skin' in specialty %}
+                    {% set doctor_image = 'https://images.unsplash.com/photo-1594824476967-48c8b964273f?auto=format&fit=crop&w=700&q=85' %}
+                {% elif 'pediatric' in specialty or 'child' in specialty %}
+                    {% set doctor_image = 'https://images.unsplash.com/photo-1559839734-2b71ea197ec2?auto=format&fit=crop&w=700&q=85' %}
+                {% elif 'neuro' in specialty %}
+                    {% set doctor_image = 'https://images.unsplash.com/photo-1622902046580-2b47f47f5471?auto=format&fit=crop&w=700&q=85' %}
+                {% elif 'gynec' in specialty or 'obstet' in specialty %}
+                    {% set doctor_image = 'https://images.unsplash.com/photo-1551601651-2a8555f1a136?auto=format&fit=crop&w=700&q=85' %}
+                {% else %}
+                    {% set doctor_image = 'https://images.unsplash.com/photo-1582750433449-648ed127bb54?auto=format&fit=crop&w=700&q=85' %}
+                {% endif %}
+
+                <article class="doctor-card doctor-profile-card">
+                    <div class="doctor-photo">
+                        <img src="{{ doctor_image }}"
+                             alt="Doctor specializing in {{ doctor.specialization }}"
+                             loading="lazy"
+                             onerror="this.onerror=null;this.src='https://images.unsplash.com/photo-1559839734-2b71ea197ec2?auto=format&fit=crop&w=700&q=85';">
+                        <span class="doctor-photo-badge">MediCare+ Specialist</span>
+                    </div>
+
+                    <div class="doctor-profile-details">
+                        <h3>
+                            {% set clean_name = doctor.name|trim %}
+                            {% if clean_name[:3]|lower == 'dr.' %}
+                                {{ clean_name }}
+                            {% elif clean_name[:3]|lower == 'dr ' %}
+                                Dr. {{ clean_name[3:]|trim }}
+                            {% else %}
+                                Dr. {{ clean_name }}
+                            {% endif %}
+                        </h3>
+
+                        <p class="specialty">{{ doctor.specialization }}</p>
+                        <p class="doctor-experience">✚ {{ doctor.experience }} years of experience</p>
+                        <p class="fee">Consultation fee: ₹{{ doctor.fee }}</p>
+
+                        {% if doctor.review_count and doctor.review_count > 0 %}
+                            <p class="doctor-rating">
+                                ★ {{ "%.1f"|format(doctor.average_rating|float) }}
+                                <span>({{ doctor.review_count }} reviews)</span>
+                            </p>
+                        {% else %}
+                            <p class="doctor-no-reviews">No reviews yet</p>
+                        {% endif %}
+
+                        <a href="{{ url_for('patient_dashboard') }}" class="btn doctor-book-btn">Book Appointment</a>
+                    </div>
+                </article>
+            {% else %}
+                <p>No doctors are currently available.</p>
+            {% endfor %}
+        </div>
+    {% else %}
+        <div class="section-heading">
+            <a href="{{ url_for('login') }}" class="btn">Login to View Doctors</a>
+        </div>
+    {% endif %}
+</section>
+
+<section class="reviews-section">
+    <div class="section-heading">
+        <p class="eyebrow">PATIENT FEEDBACK</p>
+        <h2>Every Patient Matters</h2>
+        <p>Read feedback shared by patients after completing their appointments.</p>
+    </div>
+
+    {% if reviews %}
+        <div class="reviews-grid">
+            {% for review in reviews %}
+                <article class="review-card">
+                    <div class="review-stars" aria-label="{{ review.rating }} out of 5 stars">
+                        {% for star in range(1, 6) %}
+                            {% if star <= review.rating %}★{% else %}☆{% endif %}
+                        {% endfor %}
+                    </div>
+                    <p class="review-quote">{{ review.review_text }}</p>
+                    <div class="review-person">
+                        <div class="review-avatar">{{ review.patient_name[0]|upper }}</div>
+                        <div>
+                            <strong>{{ review.patient_name }}</strong>
+                            <span>{{ review.doctor_name }}</span>
+                        </div>
+                    </div>
+                </article>
+            {% endfor %}
+        </div>
+    {% else %}
+        <p class="reviews-note">No patient reviews yet. Reviews will appear here after patients complete appointments and submit feedback.</p>
+    {% endif %}
+</section>
+
+<section class="home-cta">
+    <div>
+        <p class="eyebrow">TAKE THE NEXT STEP</p>
+        <h2>Your Health Journey Starts Here</h2>
+        <p>Find a doctor and book your next appointment with ease.</p>
+    </div>
+    {% if session.get('role') == 'patient' %}
+        <a href="{{ url_for('patient_dashboard') }}" class="btn">Book an Appointment</a>
+    {% elif not session.get('user_id') %}
+        <a href="{{ url_for('register') }}" class="btn">Create Your Account</a>
+    {% endif %}
+</section>
+
+<style>
+.doctor-profile-card {
+    overflow: hidden;
+    padding: 0 !important;
+}
+.doctor-photo {
+    position: relative;
+    width: 100%;
+    height: 235px;
+    overflow: hidden;
+    background: #eaf3f5;
+}
+.doctor-photo img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: center 30%;
+    transition: transform .3s ease;
+}
+.doctor-profile-card:hover .doctor-photo img {
+    transform: scale(1.04);
+}
+.doctor-photo-badge {
+    position: absolute;
+    bottom: 12px;
+    left: 12px;
+    padding: 7px 11px;
+    border-radius: 20px;
+    background: rgba(255,255,255,.94);
+    color: #176c70;
+    font-size: 11px;
+    font-weight: 700;
+}
+.doctor-profile-details {
+    padding: 22px;
+}
+.doctor-profile-details h3 {
+    margin: 0 0 8px;
+    color: #173d50;
+}
+.doctor-profile-details .specialty {
+    margin-bottom: 14px;
+    color: #087e79;
+    font-weight: 600;
+}
+.doctor-experience {
+    color: #617584;
+    font-size: 14px;
+}
+.doctor-profile-details .fee {
+    margin: 12px 0;
+    font-weight: 700;
+}
+.doctor-rating {
+    color: #b77908;
+    font-weight: 700;
+}
+.doctor-rating span {
+    color: #71828d;
+    font-size: 12px;
+    font-weight: 400;
+}
+.doctor-no-reviews {
+    color: #71828d;
+    font-size: 13px;
+}
+.doctor-book-btn {
+    display: inline-block;
+    margin-top: 10px;
+}
+@media (max-width: 600px) {
+    .doctor-photo {
+        height: 210px;
+    }
+}
+</style>
+
+{% endblock %}
