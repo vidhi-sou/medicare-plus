@@ -479,7 +479,10 @@ def login():
         ).strip()
         password = request.form.get("password", "")
 
-        if identifier.lower() == "admin@clinic.com" and password == "Admin@123":
+        if (
+    identifier.lower() == os.getenv("ADMIN_EMAIL", "").lower()
+    and password == os.getenv("ADMIN_PASSWORD", "")
+):
             session.clear()
             session["user_id"] = -1
             session["name"] = "Administrator"
