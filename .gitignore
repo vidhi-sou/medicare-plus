@@ -5,3 +5,11 @@ __pycache__/
 .venv/
 venv/
 appointments_backup.db
+# Local database backups
+*.db
+app_sqlite_backup.py
+
+# Local testing and migration helpers
+app copy.py
+inspect_db.py
+migrate_to_neon.py

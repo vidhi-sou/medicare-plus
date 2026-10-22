@@ -1,7 +1,6 @@
 
 import os
 import re
-import sqlite3
 import secrets
 import hashlib
 import smtplib
@@ -11,7 +10,10 @@ from zoneinfo import ZoneInfo
 from functools import wraps
 from pathlib import Path
 from email.message import EmailMessage
+from contextlib import contextmanager
 
+import psycopg
+from psycopg.rows import dict_row
 from dotenv import load_dotenv
 from flask import (
     Flask, render_template, request, redirect,
@@ -20,17 +22,21 @@ from flask import (
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
-# Load email settings from the .env file beside this app.py.
+# Load configuration from .env
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 app = Flask(__name__)
-app.secret_key = os.getenv(
-    "MEDICARE_SECRET_KEY",
-    "medicare_secret_key_change_later"
-)
 
-DATABASE = str(BASE_DIR / "appointments.db")
+app.secret_key = os.getenv("MEDICARE_SECRET_KEY")
+if not app.secret_key:
+    raise RuntimeError("MEDICARE_SECRET_KEY is missing from .env.")
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is missing from .env.")
+
+
 INDIA_TZ = ZoneInfo("Asia/Kolkata")
 
 DEFAULT_START_TIME = time(10, 0)
@@ -43,6 +49,55 @@ RESET_TOKEN_MINUTES = 30
 MAX_REVIEW_LENGTH = 1000
 
 
+# PostgreSQL connection. Each request block commits on success
+# and rolls back automatically if an exception occurs.
+@contextmanager
+def get_db():
+    db = psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=15
+    )
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def init_db():
+    """Check that the migrated PostgreSQL tables are available."""
+    required_tables = {
+        "users",
+        "patients",
+        "doctors",
+        "appointments",
+        "doctor_date_availability",
+        "doctor_slot_availability",
+        "doctor_reviews",
+        "password_reset_tokens",
+    }
+
+    with get_db() as db:
+        rows = db.execute("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_type = 'BASE TABLE'
+        """).fetchall()
+
+        existing = {row["table_name"] for row in rows}
+        missing = required_tables - existing
+
+        if missing:
+            raise RuntimeError(
+                "Missing PostgreSQL tables: " + ", ".join(sorted(missing))
+            )
+
+
 def india_now():
     return datetime.now(INDIA_TZ)
 
@@ -50,163 +105,6 @@ def india_now():
 def utc_now():
     return datetime.now(timezone.utc)
 
-
-def get_db():
-    db = sqlite3.connect(DATABASE, timeout=10)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys = ON")
-    return db
-
-
-def init_db():
-    """Create required database tables and safely add missing columns."""
-
-    with get_db() as db:
-        # Create the core users table if it does not exist.
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'patient',
-                phone TEXT
-            )
-        """)
-
-        # Create the patients table if it does not exist.
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS patients (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                phone TEXT
-            )
-        """)
-
-        # Create the doctors table if it does not exist.
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS doctors (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER UNIQUE,
-                name TEXT NOT NULL,
-                specialization TEXT NOT NULL,
-                experience INTEGER DEFAULT 0,
-                fee REAL DEFAULT 500,
-                available_days TEXT DEFAULT 'Monday-Friday',
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-        """)
-
-        # Create the appointments table if it does not exist.
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS appointments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                patient_id INTEGER NOT NULL,
-                doctor_id INTEGER NOT NULL,
-                appointment_date TEXT NOT NULL,
-                appointment_time TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'Booked',
-                FOREIGN KEY(patient_id) REFERENCES users(id),
-                FOREIGN KEY(doctor_id) REFERENCES doctors(id),
-                UNIQUE(doctor_id, appointment_date, appointment_time)
-            )
-        """)
-
-        # Add the phone column to older databases if necessary.
-        user_columns = {
-            row["name"]
-            for row in db.execute("PRAGMA table_info(users)").fetchall()
-        }
-
-        if "phone" not in user_columns:
-            db.execute("ALTER TABLE users ADD COLUMN phone TEXT")
-
-        patient_columns = {
-            row["name"]
-            for row in db.execute("PRAGMA table_info(patients)").fetchall()
-        }
-
-        if "phone" not in patient_columns:
-            db.execute("ALTER TABLE patients ADD COLUMN phone TEXT")
-
-        # Prevent duplicate phone numbers while allowing blank numbers.
-        db.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_unique
-            ON users(phone)
-            WHERE phone IS NOT NULL AND phone != ''
-        """)
-
-        db.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_patients_phone_unique
-            ON patients(phone)
-            WHERE phone IS NOT NULL AND phone != ''
-        """)
-
-        # Password-reset tokens.
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS password_reset_tokens (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                token_hash TEXT NOT NULL UNIQUE,
-                expires_at TEXT NOT NULL,
-                used INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-                    ON DELETE CASCADE
-            )
-        """)
-
-        # Doctor date availability.
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS doctor_date_availability (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doctor_id INTEGER NOT NULL,
-                availability_date TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'Available',
-                UNIQUE(doctor_id, availability_date),
-                FOREIGN KEY(doctor_id) REFERENCES doctors(id)
-            )
-        """)
-
-        # Individual appointment-slot availability.
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS doctor_slot_availability (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doctor_id INTEGER NOT NULL,
-                availability_date TEXT NOT NULL,
-                slot_time TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'Not Available',
-                UNIQUE(doctor_id, availability_date, slot_time),
-                FOREIGN KEY(doctor_id) REFERENCES doctors(id)
-            )
-        """)
-
-        # Patient reviews.
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS doctor_reviews (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                appointment_id INTEGER NOT NULL UNIQUE,
-                patient_id INTEGER NOT NULL,
-                doctor_id INTEGER NOT NULL,
-                rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
-                review_text TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(appointment_id) REFERENCES appointments(id)
-                    ON DELETE CASCADE,
-                FOREIGN KEY(patient_id) REFERENCES patients(id)
-                    ON DELETE CASCADE,
-                FOREIGN KEY(doctor_id) REFERENCES doctors(id)
-                    ON DELETE CASCADE
-            )
-        """)
-
-        # Improve doctor-review lookup performance.
-        db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_doctor_reviews_doctor
-            ON doctor_reviews(doctor_id)
-        """)
 
 def verify_password(stored_password, entered_password):
     if not stored_password:
@@ -222,7 +120,6 @@ def verify_password(stored_password, entered_password):
 
 
 def normalize_phone(value):
-    """Normalize a phone number for lookup and storage."""
     if not value:
         return ""
 
@@ -236,10 +133,7 @@ def normalize_phone(value):
     if len(digits) == 12 and digits.startswith("91"):
         digits = digits[2:]
 
-    if len(digits) != 10:
-        return ""
-
-    return digits
+    return digits if len(digits) == 10 else ""
 
 
 def login_required(role=None):
@@ -312,8 +206,6 @@ def is_past_slot(selected_date, slot_time):
 
 
 def send_password_reset_email(recipient, reset_url):
-    """Send a password-reset link using the configured Google SMTP account."""
-
     sender = os.getenv("MEDICARE_EMAIL", "").strip()
     app_password = os.getenv(
         "MEDICARE_EMAIL_APP_PASSWORD", ""
@@ -343,7 +235,7 @@ def send_password_reset_email(recipient, reset_url):
 def get_user_email(user_id):
     with get_db() as db:
         row = db.execute(
-            "SELECT email FROM users WHERE id = ?",
+            "SELECT email FROM users WHERE id = %s",
             (user_id,)
         ).fetchone()
         return row["email"] if row else ""
@@ -352,38 +244,26 @@ def get_user_email(user_id):
 @app.route("/")
 def home():
     with get_db() as db:
-        # Doctor details with real review averages and review counts.
         doctors = db.execute("""
             SELECT
-                d.id,
-                d.name,
-                d.specialization,
-                d.experience,
-                d.fee,
-                d.available_days,
+                d.id, d.name, d.specialization, d.experience,
+                d.fee, d.available_days,
                 COALESCE(r.average_rating, 0) AS average_rating,
                 COALESCE(r.review_count, 0) AS review_count
             FROM doctors d
             LEFT JOIN (
-                SELECT
-                    doctor_id,
-                    AVG(rating) AS average_rating,
-                    COUNT(*) AS review_count
+                SELECT doctor_id, AVG(rating) AS average_rating,
+                       COUNT(*) AS review_count
                 FROM doctor_reviews
                 GROUP BY doctor_id
             ) r ON r.doctor_id = d.id
             ORDER BY d.name
         """).fetchall()
 
-        # Only actual reviews submitted by patients appear here.
         reviews = db.execute("""
-            SELECT
-                dr.rating,
-                dr.review_text,
-                dr.created_at,
-                p.name AS patient_name,
-                d.name AS doctor_name,
-                d.specialization
+            SELECT dr.rating, dr.review_text, dr.created_at,
+                   p.name AS patient_name, d.name AS doctor_name,
+                   d.specialization
             FROM doctor_reviews dr
             JOIN patients p ON p.id = dr.patient_id
             JOIN doctors d ON d.id = dr.doctor_id
@@ -391,11 +271,7 @@ def home():
             LIMIT 6
         """).fetchall()
 
-    return render_template(
-        "home.html",
-        doctors=doctors,
-        reviews=reviews
-    )
+    return render_template("home.html", doctors=doctors, reviews=reviews)
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -405,14 +281,10 @@ def register():
         email = request.form.get("email", "").strip().lower()
         phone_input = request.form.get("phone", "").strip()
         password = request.form.get("password", "")
-
         phone = normalize_phone(phone_input) if phone_input else ""
 
         if not name or not email or len(password) < 6:
-            flash(
-                "Enter your name and email, and use a password "
-                "of at least 6 characters."
-            )
+            flash("Enter your name and email, and use a password of at least 6 characters.")
             return redirect(url_for("register"))
 
         if phone_input and not phone:
@@ -422,20 +294,16 @@ def register():
         try:
             with get_db() as db:
                 existing = db.execute("""
-                    SELECT id FROM users
-                    WHERE LOWER(email) = LOWER(?)
+                    SELECT id FROM users WHERE LOWER(email) = LOWER(%s)
                 """, (email,)).fetchone()
 
                 if existing:
-                    flash(
-                        "An account with this email already exists. "
-                        "Please log in."
-                    )
+                    flash("An account with this email already exists. Please log in.")
                     return redirect(url_for("login"))
 
                 if phone:
                     phone_user = db.execute("""
-                        SELECT id FROM users WHERE phone = ?
+                        SELECT id FROM users WHERE phone = %s
                     """, (phone,)).fetchone()
 
                     if phone_user:
@@ -444,25 +312,25 @@ def register():
 
                 hashed_password = generate_password_hash(password)
 
-                cursor = db.execute("""
+                db.execute("""
                     INSERT INTO users (name, email, password, role, phone)
-                    VALUES (?, ?, ?, 'patient', ?)
+                    VALUES (%s, %s, %s, 'patient', %s)
                 """, (name, email, hashed_password, phone or None))
 
                 db.execute("""
                     INSERT INTO patients (name, email, password, phone)
-                    VALUES (?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s)
                 """, (name, email, hashed_password, phone or None))
 
             flash("Registration successful. Please log in.")
             return redirect(url_for("login"))
 
-        except sqlite3.IntegrityError:
+        except psycopg.IntegrityError:
             app.logger.exception("Registration integrity error")
             flash("That email or phone number is already registered.")
             return redirect(url_for("register"))
 
-        except sqlite3.Error:
+        except psycopg.Error:
             app.logger.exception("Registration failed")
             flash("Registration could not be completed. Please try again.")
             return redirect(url_for("register"))
@@ -474,15 +342,19 @@ def register():
 def login():
     if request.method == "POST":
         identifier = request.form.get(
-            "identifier",
-            request.form.get("email", "")
+            "identifier", request.form.get("email", "")
         ).strip()
         password = request.form.get("password", "")
 
+        admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
+        admin_password = os.getenv("ADMIN_PASSWORD", "")
+
         if (
-    identifier.lower() == os.getenv("ADMIN_EMAIL", "").lower()
-    and password == os.getenv("ADMIN_PASSWORD", "")
-):
+            admin_email
+            and identifier.lower() == admin_email
+            and admin_password
+            and password == admin_password
+        ):
             session.clear()
             session["user_id"] = -1
             session["name"] = "Administrator"
@@ -501,14 +373,12 @@ def login():
             if is_email:
                 user = db.execute("""
                     SELECT id, name, email, password, role, phone
-                    FROM users
-                    WHERE LOWER(email) = LOWER(?)
+                    FROM users WHERE LOWER(email) = LOWER(%s)
                 """, (normalized_identifier,)).fetchone()
             else:
                 user = db.execute("""
                     SELECT id, name, email, password, role, phone
-                    FROM users
-                    WHERE phone = ?
+                    FROM users WHERE phone = %s
                 """, (normalized_identifier,)).fetchone()
 
             if not user or not verify_password(user["password"], password):
@@ -516,10 +386,9 @@ def login():
                 return redirect(url_for("login"))
 
             if not user["password"].startswith(("scrypt:", "pbkdf2:")):
-                db.execute(
-                    "UPDATE users SET password = ? WHERE id = ?",
-                    (generate_password_hash(password), user["id"])
-                )
+                db.execute("""
+                    UPDATE users SET password = %s WHERE id = %s
+                """, (generate_password_hash(password), user["id"]))
 
             session.clear()
             session["user_id"] = user["id"]
@@ -527,10 +396,9 @@ def login():
             session["role"] = user["role"]
 
             if user["role"] == "doctor":
-                doctor = db.execute(
-                    "SELECT id FROM doctors WHERE user_id = ?",
-                    (user["id"],)
-                ).fetchone()
+                doctor = db.execute("""
+                    SELECT id FROM doctors WHERE user_id = %s
+                """, (user["id"],)).fetchone()
 
                 if not doctor:
                     session.clear()
@@ -570,15 +438,13 @@ def forgot_password():
         with get_db() as db:
             user = db.execute("""
                 SELECT id, email FROM users
-                WHERE LOWER(email) = LOWER(?)
-                  AND role = 'patient'
+                WHERE LOWER(email) = LOWER(%s) AND role = 'patient'
             """, (email,)).fetchone()
 
             if user:
                 db.execute("""
                     UPDATE password_reset_tokens
-                    SET used = 1
-                    WHERE user_id = ? AND used = 0
+                    SET used = 1 WHERE user_id = %s AND used = 0
                 """, (user["id"],))
 
                 raw_token = secrets.token_urlsafe(32)
@@ -592,18 +458,14 @@ def forgot_password():
                 db.execute("""
                     INSERT INTO password_reset_tokens
                         (user_id, token_hash, expires_at, used, created_at)
-                    VALUES (?, ?, ?, 0, ?)
+                    VALUES (%s, %s, %s, 0, %s)
                 """, (
-                    user["id"],
-                    token_hash,
-                    expires.isoformat(),
+                    user["id"], token_hash, expires.isoformat(),
                     created.isoformat()
                 ))
 
                 reset_url = url_for(
-                    "reset_password",
-                    token=raw_token,
-                    _external=True
+                    "reset_password", token=raw_token, _external=True
                 )
 
                 try:
@@ -611,9 +473,8 @@ def forgot_password():
                 except Exception:
                     app.logger.exception("Password-reset email could not be sent")
                     db.execute("""
-                        UPDATE password_reset_tokens
-                        SET used = 1
-                        WHERE token_hash = ?
+                        UPDATE password_reset_tokens SET used = 1
+                        WHERE token_hash = %s
                     """, (token_hash,))
 
         flash(generic_message)
@@ -629,8 +490,7 @@ def reset_password(token):
     with get_db() as db:
         reset_record = db.execute("""
             SELECT id, user_id, expires_at, used
-            FROM password_reset_tokens
-            WHERE token_hash = ?
+            FROM password_reset_tokens WHERE token_hash = %s
         """, (token_hash,)).fetchone()
 
         if not reset_record or reset_record["used"]:
@@ -647,7 +507,7 @@ def reset_password(token):
 
         if utc_now() >= expires_at:
             db.execute("""
-                UPDATE password_reset_tokens SET used = 1 WHERE id = ?
+                UPDATE password_reset_tokens SET used = 1 WHERE id = %s
             """, (reset_record["id"],))
             flash("This reset link has expired. Please request a new one.")
             return redirect(url_for("forgot_password"))
@@ -667,23 +527,22 @@ def reset_password(token):
             hashed_password = generate_password_hash(password)
 
             db.execute("""
-                UPDATE users SET password = ? WHERE id = ?
+                UPDATE users SET password = %s WHERE id = %s
             """, (hashed_password, reset_record["user_id"]))
 
             user = db.execute("""
-                SELECT email FROM users WHERE id = ?
+                SELECT email FROM users WHERE id = %s
             """, (reset_record["user_id"],)).fetchone()
 
             if user:
                 db.execute("""
-                    UPDATE patients SET password = ?
-                    WHERE LOWER(email) = LOWER(?)
+                    UPDATE patients SET password = %s
+                    WHERE LOWER(email) = LOWER(%s)
                 """, (hashed_password, user["email"]))
 
             db.execute("""
-                UPDATE password_reset_tokens
-                SET used = 1
-                WHERE user_id = ?
+                UPDATE password_reset_tokens SET used = 1
+                WHERE user_id = %s
             """, (reset_record["user_id"],))
 
             flash("Password changed successfully. Please log in.")
@@ -703,10 +562,9 @@ def logout():
 @login_required("patient")
 def patient_dashboard():
     with get_db() as db:
-        patient = db.execute(
-            "SELECT id FROM patients WHERE LOWER(email) = LOWER(?)",
-            (get_user_email(session["user_id"]),)
-        ).fetchone()
+        patient = db.execute("""
+            SELECT id FROM patients WHERE LOWER(email) = LOWER(%s)
+        """, (get_user_email(session["user_id"]),)).fetchone()
 
         if not patient:
             flash("Patient profile not found.")
@@ -715,17 +573,15 @@ def patient_dashboard():
         patient_id = patient["id"]
 
         doctors = db.execute("""
-            SELECT
-                d.id, d.name, d.specialization, d.experience,
-                d.fee, d.available_days,
-                COALESCE(r.average_rating, 0) AS average_rating,
-                COALESCE(r.review_count, 0) AS review_count
+            SELECT d.id, d.name, d.specialization, d.experience,
+                   d.fee, d.available_days,
+                   COALESCE(r.average_rating, 0) AS average_rating,
+                   COALESCE(r.review_count, 0) AS review_count
             FROM doctors d
             LEFT JOIN (
                 SELECT doctor_id, AVG(rating) AS average_rating,
                        COUNT(*) AS review_count
-                FROM doctor_reviews
-                GROUP BY doctor_id
+                FROM doctor_reviews GROUP BY doctor_id
             ) r ON r.doctor_id = d.id
             ORDER BY d.name
         """).fetchall()
@@ -769,10 +625,9 @@ def patient_dashboard():
                 flash("This time slot has already passed.")
                 return redirect(url_for("patient_dashboard"))
 
-            doctor = db.execute(
-                "SELECT id FROM doctors WHERE id = ?",
-                (doctor_id,)
-            ).fetchone()
+            doctor = db.execute("""
+                SELECT id FROM doctors WHERE id = %s
+            """, (doctor_id,)).fetchone()
 
             if not doctor:
                 flash("Selected doctor was not found.")
@@ -780,7 +635,7 @@ def patient_dashboard():
 
             day_availability = db.execute("""
                 SELECT status FROM doctor_date_availability
-                WHERE doctor_id = ? AND availability_date = ?
+                WHERE doctor_id = %s AND availability_date = %s
             """, (doctor_id, appointment_date)).fetchone()
 
             if not day_availability or day_availability["status"] != "Available":
@@ -789,9 +644,8 @@ def patient_dashboard():
 
             slot_availability = db.execute("""
                 SELECT status FROM doctor_slot_availability
-                WHERE doctor_id = ?
-                  AND availability_date = ?
-                  AND slot_time = ?
+                WHERE doctor_id = %s AND availability_date = %s
+                  AND slot_time = %s
             """, (doctor_id, appointment_date, appointment_time)).fetchone()
 
             if not slot_availability or slot_availability["status"] != "Available":
@@ -800,9 +654,8 @@ def patient_dashboard():
 
             conflict = db.execute("""
                 SELECT id FROM appointments
-                WHERE doctor_id = ?
-                  AND appointment_date = ?
-                  AND appointment_time = ?
+                WHERE doctor_id = %s AND appointment_date = %s
+                  AND appointment_time = %s
                   AND status NOT IN ('Cancelled', 'Rejected')
             """, (doctor_id, appointment_date, appointment_time)).fetchone()
 
@@ -814,34 +667,27 @@ def patient_dashboard():
                 INSERT INTO appointments
                     (patient_id, doctor_id, appointment_date,
                      appointment_time, status)
-                VALUES (?, ?, ?, ?, 'Booked')
-            """, (
-                patient_id, doctor_id,
-                appointment_date, appointment_time
-            ))
+                VALUES (%s, %s, %s, %s, 'Booked')
+            """, (patient_id, doctor_id, appointment_date, appointment_time))
 
             flash("Appointment booked successfully.")
             return redirect(url_for("patient_dashboard"))
 
         appointments = db.execute("""
-            SELECT
-                a.id, a.appointment_date, a.appointment_time, a.status,
-                d.name AS doctor_name, d.specialization, d.fee,
-                dr.id AS review_id,
-                dr.rating AS review_rating,
-                dr.review_text AS review_text,
-                dr.created_at AS review_created_at
+            SELECT a.id, a.appointment_date, a.appointment_time, a.status,
+                   d.name AS doctor_name, d.specialization, d.fee,
+                   dr.id AS review_id, dr.rating AS review_rating,
+                   dr.review_text AS review_text,
+                   dr.created_at AS review_created_at
             FROM appointments a
             JOIN doctors d ON d.id = a.doctor_id
             LEFT JOIN doctor_reviews dr ON dr.appointment_id = a.id
-            WHERE a.patient_id = ?
+            WHERE a.patient_id = %s
             ORDER BY a.appointment_date DESC, a.appointment_time DESC
         """, (patient_id,)).fetchall()
 
     return render_template(
-        "patient.html",
-        doctors=doctors,
-        appointments=appointments,
+        "patient.html", doctors=doctors, appointments=appointments,
         today=india_now().date().isoformat()
     )
 
@@ -871,19 +717,17 @@ def submit_patient_review(appointment_id):
         return redirect(url_for("patient_dashboard"))
 
     with get_db() as db:
-        patient = db.execute(
-            "SELECT id FROM patients WHERE LOWER(email) = LOWER(?)",
-            (get_user_email(session["user_id"]),)
-        ).fetchone()
+        patient = db.execute("""
+            SELECT id FROM patients WHERE LOWER(email) = LOWER(%s)
+        """, (get_user_email(session["user_id"]),)).fetchone()
 
         if not patient:
             flash("Patient profile not found.")
             return redirect(url_for("logout"))
 
         appointment = db.execute("""
-            SELECT id, patient_id, doctor_id, status
-            FROM appointments
-            WHERE id = ? AND patient_id = ?
+            SELECT id, patient_id, doctor_id, status FROM appointments
+            WHERE id = %s AND patient_id = %s
         """, (appointment_id, patient["id"])).fetchone()
 
         if not appointment:
@@ -895,8 +739,7 @@ def submit_patient_review(appointment_id):
             return redirect(url_for("patient_dashboard"))
 
         existing_review = db.execute("""
-            SELECT id FROM doctor_reviews
-            WHERE appointment_id = ?
+            SELECT id FROM doctor_reviews WHERE appointment_id = %s
         """, (appointment_id,)).fetchone()
 
         if existing_review:
@@ -908,16 +751,12 @@ def submit_patient_review(appointment_id):
                 INSERT INTO doctor_reviews
                     (appointment_id, patient_id, doctor_id,
                      rating, review_text, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s)
             """, (
-                appointment["id"],
-                patient["id"],
-                appointment["doctor_id"],
-                rating,
-                review_text,
-                india_now().isoformat()
+                appointment["id"], patient["id"], appointment["doctor_id"],
+                rating, review_text, india_now().isoformat()
             ))
-        except sqlite3.IntegrityError:
+        except psycopg.IntegrityError:
             flash("This appointment has already been reviewed.")
             return redirect(url_for("patient_dashboard"))
 
@@ -940,24 +779,19 @@ def patient_slot_availability():
         return jsonify({"error": "Please select a valid date."}), 400
 
     if parsed_date < india_now().date():
-        return jsonify({
-            "slots": [],
-            "message": "Past dates cannot be booked."
-        })
+        return jsonify({"slots": [], "message": "Past dates cannot be booked."})
 
     with get_db() as db:
-        doctor = db.execute(
-            "SELECT id FROM doctors WHERE id = ?",
-            (doctor_id,)
-        ).fetchone()
+        doctor = db.execute("""
+            SELECT id FROM doctors WHERE id = %s
+        """, (doctor_id,)).fetchone()
 
         if not doctor:
             return jsonify({"error": "Doctor not found."}), 404
 
         day_availability = db.execute("""
-            SELECT status
-            FROM doctor_date_availability
-            WHERE doctor_id = ? AND availability_date = ?
+            SELECT status FROM doctor_date_availability
+            WHERE doctor_id = %s AND availability_date = %s
         """, (doctor_id, selected_date)).fetchone()
 
         if not day_availability or day_availability["status"] != "Available":
@@ -967,9 +801,8 @@ def patient_slot_availability():
             })
 
         saved_rows = db.execute("""
-            SELECT slot_time, status
-            FROM doctor_slot_availability
-            WHERE doctor_id = ? AND availability_date = ?
+            SELECT slot_time, status FROM doctor_slot_availability
+            WHERE doctor_id = %s AND availability_date = %s
         """, (doctor_id, selected_date)).fetchall()
 
         saved_statuses = {
@@ -978,10 +811,8 @@ def patient_slot_availability():
         }
 
         appointment_rows = db.execute("""
-            SELECT appointment_time
-            FROM appointments
-            WHERE doctor_id = ?
-              AND appointment_date = ?
+            SELECT appointment_time FROM appointments
+            WHERE doctor_id = %s AND appointment_date = %s
               AND status NOT IN ('Cancelled', 'Rejected')
         """, (doctor_id, selected_date)).fetchall()
 
@@ -991,7 +822,6 @@ def patient_slot_availability():
         }
 
     slots = []
-
     for slot in generate_time_slots():
         label = datetime.strptime(slot, "%H:%M").strftime("%I:%M %p")
 
@@ -1002,35 +832,26 @@ def patient_slot_availability():
         else:
             status = saved_statuses.get(slot, "Available")
 
-        slots.append({
-            "time": slot,
-            "label": label,
-            "status": status
-        })
+        slots.append({"time": slot, "label": label, "status": status})
 
-    return jsonify({
-        "slots": slots,
-        "message": "Select a slot marked Available."
-    })
+    return jsonify({"slots": slots, "message": "Select a slot marked Available."})
 
 
 @app.route("/cancel_appointment/<int:appointment_id>", methods=["POST"])
 @login_required("patient")
 def cancel_appointment(appointment_id):
     with get_db() as db:
-        patient = db.execute(
-            "SELECT id FROM patients WHERE LOWER(email) = LOWER(?)",
-            (get_user_email(session["user_id"]),)
-        ).fetchone()
+        patient = db.execute("""
+            SELECT id FROM patients WHERE LOWER(email) = LOWER(%s)
+        """, (get_user_email(session["user_id"]),)).fetchone()
 
         if not patient:
             flash("Patient profile not found.")
             return redirect(url_for("patient_dashboard"))
 
         result = db.execute("""
-            UPDATE appointments
-            SET status = 'Cancelled'
-            WHERE id = ? AND patient_id = ?
+            UPDATE appointments SET status = 'Cancelled'
+            WHERE id = %s AND patient_id = %s
               AND status NOT IN ('Cancelled', 'Rejected', 'Completed')
         """, (appointment_id, patient["id"]))
 
@@ -1057,9 +878,8 @@ def doctor_dashboard():
 
         with get_db() as db:
             result = db.execute("""
-                UPDATE appointments
-                SET status = ?
-                WHERE id = ? AND doctor_id = ?
+                UPDATE appointments SET status = %s
+                WHERE id = %s AND doctor_id = %s
             """, (status, appointment_id, doctor_id))
 
         flash(
@@ -1081,8 +901,7 @@ def doctor_dashboard():
     with get_db() as db:
         doctor = db.execute("""
             SELECT id, name, specialization, available_days
-            FROM doctors
-            WHERE id = ?
+            FROM doctors WHERE id = %s
         """, (doctor_id,)).fetchone()
 
         if not doctor:
@@ -1091,75 +910,68 @@ def doctor_dashboard():
 
         if selected_date > today:
             db.execute("""
-                INSERT OR IGNORE INTO doctor_date_availability
+                INSERT INTO doctor_date_availability
                     (doctor_id, availability_date, status)
-                VALUES (?, ?, 'Available')
+                VALUES (%s, %s, 'Available')
+                ON CONFLICT (doctor_id, availability_date) DO NOTHING
             """, (doctor_id, selected_date))
 
             current_date_status = db.execute("""
                 SELECT status FROM doctor_date_availability
-                WHERE doctor_id = ? AND availability_date = ?
+                WHERE doctor_id = %s AND availability_date = %s
             """, (doctor_id, selected_date)).fetchone()
 
             if current_date_status and current_date_status["status"] == "Available":
                 for slot in generate_time_slots():
                     db.execute("""
-                        INSERT OR IGNORE INTO doctor_slot_availability
+                        INSERT INTO doctor_slot_availability
                             (doctor_id, availability_date, slot_time, status)
-                        VALUES (?, ?, ?, 'Available')
+                        VALUES (%s, %s, %s, 'Available')
+                        ON CONFLICT (doctor_id, availability_date, slot_time)
+                        DO NOTHING
                     """, (doctor_id, selected_date, slot))
 
         availability = db.execute("""
             SELECT status FROM doctor_date_availability
-            WHERE doctor_id = ? AND availability_date = ?
+            WHERE doctor_id = %s AND availability_date = %s
         """, (doctor_id, selected_date)).fetchone()
 
-        availability_status = (
-            availability["status"] if availability else "Not Set"
-        )
+        availability_status = availability["status"] if availability else "Not Set"
 
         appointments = db.execute("""
             SELECT a.id, a.appointment_date, a.appointment_time, a.status,
                    p.name AS patient_name, p.email AS patient_email
             FROM appointments a
             JOIN patients p ON p.id = a.patient_id
-            WHERE a.doctor_id = ?
+            WHERE a.doctor_id = %s
             ORDER BY a.appointment_date DESC, a.appointment_time DESC
         """, (doctor_id,)).fetchall()
 
         date_appointments = db.execute("""
-            SELECT appointment_time, status
-            FROM appointments
-            WHERE doctor_id = ?
-              AND appointment_date = ?
+            SELECT appointment_time, status FROM appointments
+            WHERE doctor_id = %s AND appointment_date = %s
               AND status NOT IN ('Cancelled', 'Rejected')
         """, (doctor_id, selected_date)).fetchall()
 
         saved_dates = db.execute("""
-            SELECT availability_date, status
-            FROM doctor_date_availability
-            WHERE doctor_id = ?
-            ORDER BY availability_date DESC
+            SELECT availability_date, status FROM doctor_date_availability
+            WHERE doctor_id = %s ORDER BY availability_date DESC
         """, (doctor_id,)).fetchall()
 
         slot_rows = db.execute("""
-            SELECT slot_time, status
-            FROM doctor_slot_availability
-            WHERE doctor_id = ? AND availability_date = ?
+            SELECT slot_time, status FROM doctor_slot_availability
+            WHERE doctor_id = %s AND availability_date = %s
         """, (doctor_id, selected_date)).fetchall()
 
     saved_slot_status = {
-        normalize_time(row["slot_time"]): row["status"]
-        for row in slot_rows
+        normalize_time(row["slot_time"]): row["status"] for row in slot_rows
     }
-
     booked_slots = {
         normalize_time(row["appointment_time"]): row["status"]
         for row in date_appointments
     }
 
     slots = []
-
     for slot in generate_time_slots():
         label = datetime.strptime(slot, "%H:%M").strftime("%I:%M %p")
         past = is_past_slot(selected_date, slot)
@@ -1167,9 +979,7 @@ def doctor_dashboard():
 
         if booked_status:
             slot_status = "Booked"
-        elif past:
-            slot_status = "Not Available"
-        elif availability_status != "Available":
+        elif past or availability_status != "Available":
             slot_status = "Not Available"
         else:
             slot_status = saved_slot_status.get(slot, "Available")
@@ -1182,8 +992,7 @@ def doctor_dashboard():
             "booked": bool(booked_status),
             "can_edit": (
                 availability_status == "Available"
-                and not past
-                and not booked_status
+                and not past and not booked_status
             )
         })
 
@@ -1211,9 +1020,8 @@ def update_appointment(appointment_id):
 
     with get_db() as db:
         result = db.execute("""
-            UPDATE appointments
-            SET status = ?
-            WHERE id = ? AND doctor_id = ?
+            UPDATE appointments SET status = %s
+            WHERE id = %s AND doctor_id = %s
         """, (status, appointment_id, session.get("doctor_id")))
 
     flash(
@@ -1258,7 +1066,7 @@ def update_doctor_availability():
         with get_db() as db:
             day_status = db.execute("""
                 SELECT status FROM doctor_date_availability
-                WHERE doctor_id = ? AND availability_date = ?
+                WHERE doctor_id = %s AND availability_date = %s
             """, (doctor_id, selected_date)).fetchone()
 
             if not day_status or day_status["status"] != "Available":
@@ -1267,9 +1075,8 @@ def update_doctor_availability():
 
             existing_booking = db.execute("""
                 SELECT id FROM appointments
-                WHERE doctor_id = ?
-                  AND appointment_date = ?
-                  AND appointment_time = ?
+                WHERE doctor_id = %s AND appointment_date = %s
+                  AND appointment_time = %s
                   AND status NOT IN ('Cancelled', 'Rejected')
             """, (doctor_id, selected_date, slot_time)).fetchone()
 
@@ -1280,9 +1087,9 @@ def update_doctor_availability():
             db.execute("""
                 INSERT INTO doctor_slot_availability
                     (doctor_id, availability_date, slot_time, status)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(doctor_id, availability_date, slot_time)
-                DO UPDATE SET status = excluded.status
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (doctor_id, availability_date, slot_time)
+                DO UPDATE SET status = EXCLUDED.status
             """, (doctor_id, selected_date, slot_time, slot_status))
 
         flash(f"{slot_time} marked as {slot_status}.")
@@ -1296,18 +1103,20 @@ def update_doctor_availability():
         db.execute("""
             INSERT INTO doctor_date_availability
                 (doctor_id, availability_date, status)
-            VALUES (?, ?, ?)
-            ON CONFLICT(doctor_id, availability_date)
-            DO UPDATE SET status = excluded.status
+            VALUES (%s, %s, %s)
+            ON CONFLICT (doctor_id, availability_date)
+            DO UPDATE SET status = EXCLUDED.status
         """, (doctor_id, selected_date, status))
 
         if status == "Available":
             for slot in generate_time_slots():
                 if not is_past_slot(selected_date, slot):
                     db.execute("""
-                        INSERT OR IGNORE INTO doctor_slot_availability
+                        INSERT INTO doctor_slot_availability
                             (doctor_id, availability_date, slot_time, status)
-                        VALUES (?, ?, ?, 'Available')
+                        VALUES (%s, %s, %s, 'Available')
+                        ON CONFLICT (doctor_id, availability_date, slot_time)
+                        DO NOTHING
                     """, (doctor_id, selected_date, slot))
 
     flash(
@@ -1326,10 +1135,8 @@ def admin_dashboard():
         ).fetchall()
 
         patients = db.execute("""
-            SELECT id, name, email
-            FROM users
-            WHERE role = 'patient'
-            ORDER BY name
+            SELECT id, name, email FROM users
+            WHERE role = 'patient' ORDER BY name
         """).fetchall()
 
         appointments = db.execute("""
@@ -1369,24 +1176,29 @@ def add_doctor():
             raise ValueError
 
         with get_db() as db:
-            cursor = db.execute("""
+            user = db.execute("""
                 INSERT INTO users (name, email, password, role)
-                VALUES (?, ?, ?, 'doctor')
-            """, (name, email, generate_password_hash(password)))
-            user_id = cursor.lastrowid
+                VALUES (%s, %s, %s, 'doctor')
+                RETURNING id
+            """, (name, email, generate_password_hash(password))).fetchone()
+
+            user_id = user["id"]
 
             db.execute("""
                 INSERT INTO doctors
                     (user_id, name, specialization, experience, fee)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s)
             """, (user_id, name, specialization, experience, fee))
 
         flash("Doctor added. They can now log in.")
 
-    except sqlite3.IntegrityError:
+    except psycopg.IntegrityError:
         flash("Could not add doctor. This email may already be registered.")
     except ValueError:
         flash("Enter valid non-negative numbers for experience and fee.")
+    except psycopg.Error:
+        app.logger.exception("Could not add doctor")
+        flash("Doctor could not be added. Please try again.")
 
     return redirect(url_for("admin_dashboard"))
 
@@ -1395,39 +1207,36 @@ def add_doctor():
 @login_required("admin")
 def delete_doctor(doctor_id):
     with get_db() as db:
-        doctor = db.execute(
-            "SELECT * FROM doctors WHERE id = ?",
-            (doctor_id,)
-        ).fetchone()
+        doctor = db.execute("""
+            SELECT * FROM doctors WHERE id = %s
+        """, (doctor_id,)).fetchone()
 
         if doctor:
-            # Delete reviews explicitly before deleting appointment records.
             db.execute(
-                "DELETE FROM doctor_reviews WHERE doctor_id = ?",
+                "DELETE FROM doctor_reviews WHERE doctor_id = %s",
                 (doctor_id,)
             )
             db.execute(
-                "DELETE FROM appointments WHERE doctor_id = ?",
+                "DELETE FROM appointments WHERE doctor_id = %s",
                 (doctor_id,)
             )
             db.execute(
-                "DELETE FROM doctor_slot_availability WHERE doctor_id = ?",
+                "DELETE FROM doctor_slot_availability WHERE doctor_id = %s",
                 (doctor_id,)
             )
             db.execute(
-                "DELETE FROM doctor_date_availability WHERE doctor_id = ?",
+                "DELETE FROM doctor_date_availability WHERE doctor_id = %s",
                 (doctor_id,)
             )
             db.execute(
-                "DELETE FROM doctors WHERE id = ?",
+                "DELETE FROM doctors WHERE id = %s",
                 (doctor_id,)
             )
 
             if doctor["user_id"] is not None:
-                db.execute(
-                    "DELETE FROM users WHERE id = ? AND role = 'doctor'",
-                    (doctor["user_id"],)
-                )
+                db.execute("""
+                    DELETE FROM users WHERE id = %s AND role = 'doctor'
+                """, (doctor["user_id"],))
 
     flash("Doctor profile and associated appointment records removed.")
     return redirect(url_for("admin_dashboard"))
