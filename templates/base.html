@@ -4,9 +4,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
     <meta name="google-site-verification" content="tbPeQqUYV3fMWjz_WJjY7Hr785huKb0OvL_qDOWd9R0" />
 
+    <meta name="description" content="Book doctor appointments online with MediCare+. Explore doctors, check available time slots, manage appointments, and access a simple healthcare booking system." />
+
     <title>{% block title %}MediCare+ | Doctor Appointments{% endblock %}</title>
+
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 
     <style>
@@ -151,6 +155,7 @@
                     <span class="welcome">
                         Hi, {{ session.get('name', 'User') }}
                     </span>
+
                     <a href="{{ url_for('logout') }}" class="btn btn-outline">
                         Logout
                     </a>
